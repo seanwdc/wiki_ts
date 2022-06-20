@@ -1,0 +1,343 @@
+---
+title: "DSA301 Project"
+author: "Everyone"
+output: html_document
+---
+
+##Loading Packages
+```{r cars, include=FALSE}
+rm(list = ls())
+library(jsonlite)
+library(lubridate)
+library(forecast)
+library(urca)
+library(TSstudio)
+library(prophet)
+library(randomForest)
+library(keras) # for deep learning
+library(tidyverse) # general utility functions
+library(caret) # machine learning utility functions
+library(randomForest) # for RF modelling 
+#source("dataprocessing.R")
+```
+
+
+```{r}
+test = filter(daily_data, year(date) == 2020)
+ts2020 = test$views %>% msts(., seasonal.periods = c(7,365), start = c(2020,1,1))
+autoplot(ts2020)
+
+```
+
+
+
+### Reading CSV, Processing into TS Object, Visualisation of Data
+```{r}
+daily_data = read_csv('trainvaldf.csv', show_col_types = FALSE)
+daily_data = daily_data %>% mutate(day_week = as.factor(wday(ymd(daily_data$date), label = T)), month_of_year = as.factor(month(ymd(daily_data$date), label = T)))
+# train = get_train_df(daily_data)
+# Putting data into TS Object
+msts_wiki_daily = daily_data$views %>% msts(seasonal.periods = c(7, 365), start =c(2015, as.numeric(format(daily_data$date[1], "%j"))))
+
+# Creating Train and Test Set
+train_size = length(daily_data$date[year(daily_data$date) < 2021])
+val_size = dim(daily_data)[1] - train_size
+
+msts_split <- ts_split(msts_wiki_daily, sample.out = val_size)
+msts_train = msts_split$train
+msts_test = msts_split$test
+
+
+### STL Decomposition
+daily_train_decomp = mstl(msts_train, robust = TRUE)
+autoplot(daily_train_decomp)
+seasadj_wiki <- seasadj(daily_train_decomp)
+autoplot(msts_train)
+```
+
+###Visualising STL decomposition
+```{r}
+autoplot(daily_train_decomp)
+
+ggplot(daily_data[1:train_size,], aes(x = day_week, y = views))+geom_boxplot()
+
+ggplot(daily_data[1:train_size,], aes(x = month_of_year, y = views))+geom_boxplot()
+
+ggseasonplot(msts_train)
+# Both the yearly seasonal pattern and the weekly seasonal pattern seem significant (in terms of impact on overall data), and therefore we do not rule any of them out at the moment.
+```
+## Differencing Seasonal Adjusted Component
+```{r include=FALSE}
+# new = 6.483
+seasadj_wiki %>% ur.kpss() %>% summary()
+
+# new = 0.0102
+seasadj_wiki %>% 
+  diff(lag =1)%>%
+  ur.kpss()%>%
+  summary()
+
+# new = 0.0137
+seasadj_wiki %>% 
+  diff(lag =7)%>%
+  ur.kpss()%>%
+  summary()
+
+# new = 0.0026
+seasadj_wiki %>% 
+  diff(lag =7)%>% 
+  diff(lag = 1)%>%
+  ur.kpss()%>%
+  summary()
+
+# new = 2.2177
+seasadj_wiki %>% 
+  diff(lag = 365)%>%
+  ur.kpss()%>%
+  summary()
+
+# new = 0.0137
+seasadj_wiki %>% 
+  diff(lag =365)%>% 
+  diff(lag = 1)%>%
+  ur.kpss()%>%
+  summary()
+```
+
+
+##Benchmark Models
+###Benchmark Model Creation
+```{r}
+b1 <- stlf(msts_train, method = "naive", robust = T, h = val_size)
+b2 <- stlf(msts_train, method = "rwdrift", robust = T, h = val_size)
+checkresiduals(b1)
+checkresiduals(b2)
+accuracy(b1, msts_test)
+accuracy(b2, msts_test)
+
+# b1 RMSE - 13.946462
+# b2 RMSE - 12.75999
+# Ljung Box Test - Both Fail
+```
+##ETS Model
+###ETS Model Creation
+```{r}
+b3 <- stlf(msts_train, method = "ets", robust = T, h = val_size)
+checkresiduals(b3)
+accuracy(b3, msts_test)
+```
+##ARIMA Models
+###ACF & PACF Analysis for Differenced & Undifferenced Seasonal Adjusted Component
+```{r}
+# These two approaches to differencing yielded the lowest p value for the KPSS test.
+trans_seasadj_wiki_1 <- seasadj_wiki %>%diff(lag = 1)
+trans_seasadj_wiki_2 <- seasadj_wiki %>%diff(lag = 7)%>%diff(lag = 1)
+autoplot(trans_seasadj_wiki_1)
+autoplot(trans_seasadj_wiki_2)
+
+ggtsdisplay(seasadj_wiki)
+pacf(seasadj_wiki)
+acf(seasadj_wiki)
+
+# ACF is slowly decreasing. This means that there is high autocorrelation with each lagged variable, suggesting that there is a unit root in the data and it is not stationary. This confirms what we had found earlier. We will look at the ACF and PACF of the variable based on the taking the difference, suggested by the KPSS test.
+
+ggtsdisplay(trans_seasadj_wiki_1)
+pacf(trans_seasadj_wiki_1)
+acf(trans_seasadj_wiki_1)
+
+# ACF at seasonal lags shows slow decrease. 
+# Non seasonal we see a sharp dropoff in ACF almost immediately after the second lag, suggesting it might be a MA(2)
+
+ggtsdisplay(trans_seasadj_wiki_2)
+pacf(trans_seasadj_wiki_2)
+acf(trans_seasadj_wiki_2)
+## Non seasonal AR 2? Seasonal AR? Seasonal MA (1)? Non seasonal MA(3)? 
+```
+###Shortlisting of ARIMA Models based of AICc
+```{r}
+A0 <- auto.arima(ts(seasadj_wiki, frequency = 7)) #(4,1,1)(2,0,2)[7]
+
+# Variations based on the 1 non seasonal differencing
+
+A2 <- Arima(seasadj_wiki, order=c(2,1,3), seasonal = list(order = c(2,0,3), period = 7))
+A4 <- Arima(seasadj_wiki, order=c(3,1,3), seasonal = list(order = c(2,0,2), period = 7))
+
+# Variations based on having both seasonal and non seasonal differencing
+
+A6 <- Arima(seasadj_wiki, order=c(3,1,3), seasonal = list(order = c(2,1,1), period = 7))
+A7 <- Arima(seasadj_wiki, order=c(3,1,3), seasonal = list(order = c(2,1,3), period = 7))
+checkresiduals(A2)
+checkresiduals(A0)
+checkresiduals(A4)
+checkresiduals(A6)
+Box.test(A7)
+
+# Trying to work off a more specific implementation of auto.arima where the differences already specified.
+finalA = auto.arima(ts(seasadj_wiki, frequency = 7), d =1, D = 1)
+
+data.frame(model = c("A0", "A2", "A4", "A6","A7", "finalA"),
+                       AIC = c(A0$aicc, A2$aicc, A4$aicc, A6$aicc, A7$aicc, finalA$aicc)) 
+# For models with 1 non-seasonal differencing, we started doing checkresiduals() with the models with lowest AICc first but only the model A4 which has the highest AICc among the possible models with 1 non-seasonal differencing passed the Ljung Box Test. For models with both seasonal and non seasonal differencing, both A7 and A6 passed the Ljung Box Test.
+```
+###Checking Residuals & Accuracy of Shortlisted ARIMA Models
+```{r}
+#Only only that passed were (4,1,3)(2,1,2)[7] and (4,1,3)(1,0,2)[7]
+
+build_arima = function(dataset, non_seasonal_comp, seasonal_comp) {
+  return(stlm(dataset, modelfunction = Arima, order = non_seasonal_comp, seasonal = list(order = seasonal_comp, period = 7), robust = T))
+}
+
+get_important_stats = function(model) {
+  model_forecast = forecast(model, h = val_size)
+  residual_check = checkresiduals(model_forecast)$p.value
+  rmse = accuracy(model_forecast, msts_test)[2,2]
+  return_list = list(residual_check, rmse)
+  names(return_list) = c("Ljung Box p value", "RMSE")
+                     
+  return (return_list)
+}
+
+f0 = build_arima(msts_train, c(4,1,1), c(2,0,2))
+f2 = build_arima(msts_train, c(2,1,3), c(2,0,3))
+f4 = build_arima(msts_train, c(3,1,3), c(2,0,2))
+f6 = build_arima(msts_train, c(3,1,3), c(2,1,1))
+f7 = build_arima(msts_train, c(3,1,3), c(2,1,3))
+
+# get_important_stats(f7)
+checkresiduals(f7)
+
+checkresiduals(forecast(f0, h = val_size))$p.value
+checkresiduals(forecast(f2, h= val_size)) 
+checkresiduals(forecast(f4, h = val_size)) #PASS
+checkresiduals(forecast(f6, h = val_size)) # PASS
+checkresiduals(forecast(f7, h = val_size)) # PASS
+
+#Only f4, f6, f7 passed the Ljung-Box Test for the train set
+accuracy(forecast(f4, h= val_size), msts_test)
+accuracy(forecast(f6, h = val_size), msts_test)
+accuracy(forecast(f7, h = val_size), msts_test)
+
+#f7 has the lowest test RMSE of 10.096913 compared to f4 with 10.59022 and f6 with 10.108296.
+```
+
+## ARIMA-X with 2020 Outlier
+```{r}
+daily_data$y2020 = sapply(daily_data$date, function(x) {
+  if (year(x) ==2020 && month(x) >= 3 && month(x) <= 7) {return(1)}
+  return(0)
+})
+
+train2020_dummy = daily_data$y2020[1:train_size]
+test2020_dummy = daily_data$y2020[(train_size+1): dim(daily_data)[1]]
+
+## Alternative Approach manually forecasting everything.
+arimax_model= Arima(seasadj_wiki, order=c(3,1,3), seasonal = list(order = c(2,1,3), period = 7), xreg = train2020_dummy) %>% forecast (., xreg = test2020_dummy, h = val_size)
+
+arimax_model$model
+
+seas7 = seasonal(daily_train_decomp)[,1] %>% ts(., frequency = 7) %>% snaive(., h= val_size) %>%  forecast()
+seas365 = seasonal(daily_train_decomp)[,2] %>% snaive(.,h = val_size) %>% forecast()
+
+
+accuracy(as.vector(seas7$mean) + seas365$mean + arimax_model$mean, msts_test)
+
+final_final = as.vector(seas7$mean) + seas365$mean + arimax_model$mean %>% msts(., seasonal.periods = c(365,7), start = c(2021,1,1))
+autoplot(dailyviews, series = "Actual") + autolayer(final_final, series = "Arima-X Prediction")
+
+# RMSE of 10.57301, which is worse than the original model without the adjustment for 2020
+```
+
+## Facebook Prophet
+```{r}
+prophet_data = rename(daily_data, y = views, ds = date)
+prophet_train = slice_head(prophet_data, n = train_size)
+prophet_test = slice_tail(prophet_data, n = val_size)
+
+model = prophet(prophet_train, daily.seasonality = FALSE)
+
+# Prediction
+future = make_future_dataframe(model, periods = dim(prophet_test)[1])
+prophet_forecast = predict(model, future)
+prophet_predict = predict(model, future) %>% slice_tail(., n = dim(prophet_test)[1])
+accuracy(prophet_test$y, prophet_predict$yhat)
+# RMSE 23.79169 which is significantly worse. Problem is that the model does not do a good job of estiamting the long term trend.
+
+
+
+# Evaluation
+prophet_plot_components(model, prophet_forecast)
+prophet_weekly = prophet_forecast$weekly %>% tail(., val_size)
+prophet_yearly = prophet_forecast$yearly %>% tail(., val_size)
+new_model = Arima(seasadj_wiki, order=c(3,1,3), seasonal = list(order = c(2,1,1), period = 7)) %>% forecast (.,, h = val_size)
+seas7 = seasonal(daily_train_decomp)[,1] %>% ts(., frequency = 7) %>% snaive(., h= val_size) %>%  forecast()
+seas365 = seasonal(daily_train_decomp)[,2] %>% snaive(.,h = val_size) %>% forecast()
+accuracy(prophet_weekly + prophet_yearly + new_model$mean, msts_test)
+accuracy(as.vector(seas7$mean) + seas365$mean + new_model$mean, msts_test)
+
+
+# autoplot(prophet_forecast$yhat)
+```
+
+
+
+
+
+
+
+
+### Plotting Results
+```{r}
+
+plot_info = function(model,name){
+  autoplot(msts_wiki_daily, series = "Original")+
+    autolayer(forecast(model, h = val_size), PI = F, alpha = 0.9, 
+              col = "red", 
+              series = "Forecast")+
+    scale_colour_manual(values=c("Original"="black","Forecast"="red"),
+                        breaks=c("Original","Forecast"))+
+    ggtitle(name) 
+}
+
+val_fct = function(model,name){
+  autoplot(msts_test, series = "Original")+
+    autolayer(forecast(model, h = val_size), PI = F, alpha = 0.9, 
+              col = "red", 
+              series = "Forecast")+
+    scale_colour_manual(values=c("Original"="black","Forecast"="red"),
+                        breaks=c("Original","Forecast"))+
+    ggtitle(name) 
+}
+
+prophet_ts = prophet_predict$yhat %>% msts(., seasonal.periods = c(7,365), start = c(2021,1,1))
+
+dailyviews =msts(msts_test,seasonal.periods = c(7,365), start = c(2021,1,1))
+autoplot(dailyviews, series = "Actual") + autolayer(prophet_ts, series = "Prophet Prediction")
+
+# Benchmark Models
+val_fct(b1, "Naive Model")
+val_fct(b2, "Drift Model")
+val_fct(b3, "ETS Model")
+# Best ARIMA Models
+plot_info(f7, "ARIMA (3,1,3)(2,1,3)[7] Model")
+
+```
+
+
+## Final Comparisons
+```{r}
+## Prophet
+accuracy(prophet_test$y, prophet_predict$yhat)
+## ARIMA
+accuracy(forecast(f7, h = val_size), msts_test)
+## ETS
+
+## Benchmark
+mstl(msts_test)
+
+```
+
+
+```{r}
+
+```
+
